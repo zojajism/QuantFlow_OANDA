@@ -1,0 +1,42 @@
+# streams.yaml
+
+streams:
+  - name: STREAM_CANDLES
+    subjects: ["candles.>"]
+    storage: file            # file | memory
+    retention: limits        # limits | interest | workqueue
+    max_bytes: "5GB"         # quoted to avoid YAML misread
+    max_age: "168h"          # quoted duration (7 days)
+    discard: old             # old | new
+    dupe_window: "2m"        # quoted duration
+    replicas: 1
+
+  - name: STREAM_TICKS
+    subjects: ["ticks.>"]
+    storage: file
+    retention: limits
+    max_bytes: "2GB"
+    max_age: "24h"
+    discard: old
+    dupe_window: "2m"
+    replicas: 1
+  
+  - name: STREAM_ALERTS
+    subjects: ["alerts.>"]
+    storage: file
+    retention: limits
+    max_bytes: "2GB"
+    max_age: "24h"
+    discard: old
+    dupe_window: "2m"
+    replicas: 1
+
+  - name: STREAM_ENGINE
+    subjects: ["engine.>"]
+    storage: file
+    retention: limits
+    max_bytes: "2GB"
+    max_age: "24h"
+    discard: old
+    dupe_window: "2m"
+    replicas: 1

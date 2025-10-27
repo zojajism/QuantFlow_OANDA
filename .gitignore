@@ -1,0 +1,58 @@
+# Python cache & compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Virtual Environment
+.venv/
+venv/
+env/
+.env
+
+# IDEs
+.vscode/
+.idea/
+
+# Notebooks
+*.ipynb_checkpoints/
+
+# Jupyter runtime
+.profile
+.ipynb_checkpoints/
+jupyter_notebook_config.py
+~$*
+
+# Logs
+*.log
+*.tmp
+*.log.*
+
+# MacOS system files
+.DS_Store
+
+# Rust / Cargo build artifacts
+/target/
+Cargo.lock
+
+# Binary or compiled outputs
+*.so
+*.dll
+*.dylib
+*.exe
+
+# dotenv (secrets, API keys)
+.env
+.env.*
+# Allow example env to be tracked
+!.env.example
+
+# ClickHouse local backups (if any)
+/*.sql.bak
+/*.sql.gz
+
+# Project-specific
+data/
+*.sqlite
+*.db
+*.ck
