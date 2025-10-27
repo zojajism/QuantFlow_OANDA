@@ -16,11 +16,10 @@ from telegram_notifier import (
     ChatType,
 )
 
-# --- OANDA exchange adapter (ticks + candles-from-ticks)
+# --- OANDA exchange adapter (ticks + candles via REST)
 from exchange_oanda import (
     get_oanda_tick_stream,
-    get_oanda_candles_from_ticks,
-    make_tick_queue,
+    get_oanda_candles_rest,  # <-- new: fetch closed candles from OANDA REST
     OandaEnv,
 )
 
@@ -62,12 +61,15 @@ async def main():
         with CONFIG_PATH.open("r", encoding="utf-8") as f:
             config_data = yaml.safe_load(f) or {}
 
-        # Expecting same keys you used before
-        symbols_cfg = [str(s) for s in config_data.get("symbols", [])]      # e.g., ["EUR/USD","GBP/USD"]
-        timeframes = [str(t).upper() for t in config_data.get("timeframes", [])]  # e.g., ["S5","M1","M5"]
+        # Your same config structure
+        symbols_cfg = [str(s) for s in config_data.get("symbols", [])]
+        timeframes = [str(t).lower() for t in config_data.get("timeframes", [])]  # e.g., ["1m","3m","1h","4h","1d"]
 
         # --- Env & credentials
-        oanda_env = OandaEnv.LIVE  # you said "live data and everything real"
+        # Set OANDA_ENV=live or practice in .env
+        env_flag = (os.getenv("OANDA_ENV") or "live").strip().lower()
+        oanda_env = OandaEnv.LIVE if env_flag == "live" else OandaEnv.PRACTICE
+
         oanda_token = os.getenv("OANDA_API_TOKEN")
         oanda_account = os.getenv("OANDA_ACCOUNT_ID")
 
@@ -89,9 +91,6 @@ async def main():
         await ensure_streams_from_yaml(nc, "streams.yaml")
 
         # --- Build tasks
-        # We keep your "two groups of tasks" feel:
-        #   - ticker_tasks: one producer per symbol (pushes to NATS + tick_queue)
-        #   - candle_tasks: one consumer per symbol (builds candles for all timeframes from the shared queue)
         ticker_tasks = []
         candle_tasks = []
 
@@ -99,10 +98,9 @@ async def main():
         price_modes = ["M"]
 
         for symbol in symbols_cfg:
-            instrument = to_oanda_instrument(symbol) 
-            tick_q = make_tick_queue(maxsize=5000)
+            instrument = to_oanda_instrument(symbol)  # e.g., "EUR_USD"
 
-            # Ticker stream (producer)
+            # Ticker stream (producer) — optional but you already run it
             ticker_tasks.append(
                 get_oanda_tick_stream(
                     instrument=instrument,
@@ -111,24 +109,28 @@ async def main():
                     token=oanda_token,
                     nc=nc,
                     env=oanda_env,
-                    tick_queue=tick_q,
+                    tick_queue=None,  # no need to feed candle builders now
                 )
             )
 
-            # Candle builder (consumer) for ALL requested timeframes of this symbol
+            # Candle fetcher from OANDA REST for ALL requested timeframes of this symbol
             if timeframes:
                 candle_tasks.append(
-                    get_oanda_candles_from_ticks(
-                        display_symbol=symbol,   # ← this function takes display_symbol (not instrument)
-                        timeframes=timeframes,   # e.g., ["S5","M1","M5"]
-                        price_modes=price_modes,    # ["M"] now; can become ["M","B","A"]
+                    get_oanda_candles_rest(
+                        display_symbol=symbol,
+                        instrument=instrument,
+                        timeframes=timeframes,   # e.g., ["1m","3m","5m","1h","4h","1d"]
+                        price_modes=price_modes, # ["M"] now; can become ["M","B","A"]
+                        token=oanda_token,
                         nc=nc,
-                        tick_queue=tick_q,
+                        env=oanda_env,
+                        poll_interval_sec=2,     # small polling loop; adjust if needed
                     )
                 )
 
         # --- Run
         await asyncio.gather(*candle_tasks, *ticker_tasks)
+        
 
     finally:
         notify_telegram("⛔️ Data Collector App stopped.", ChatType.ALERT)

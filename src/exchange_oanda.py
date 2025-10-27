@@ -27,6 +27,12 @@ def _stream_host(env):
     return "https://stream-fxtrade.oanda.com"
 
 
+def _api_host(env):
+    if env == OandaEnv.PRACTICE:
+        return "https://api-fxpractice.oanda.com"
+    return "https://api-fxtrade.oanda.com"
+
+
 # =========================
 #   SMALL HELPERS
 # =========================
@@ -47,7 +53,6 @@ def _display_split(symbol_str):
     parts = symbol_str.strip().upper().split("/")
     if len(parts) == 2:
         return parts[0], parts[1]
-    # fallback: whole symbol as base, no quote
     return symbol_str.strip().upper(), ""
 
 
@@ -56,45 +61,45 @@ def _to_oanda_instrument(symbol_str):
     return symbol_str.strip().upper().replace("/", "_")
 
 
-def _floor_to_period_utc(dt_utc, period_s):
-    # floor a UTC-aware datetime to the start of its period
-    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    seconds = int((dt_utc - epoch).total_seconds())
-    floored = seconds - (seconds % period_s)
-    return epoch + timedelta(seconds=floored)
-
-
-def _pick_price(bid, ask, mode):
-    # mode: "M" (mid), "B" (bid), "A" (ask)
-    if mode == "B":
-        return bid
-    if mode == "A":
-        return ask
-    return (bid + ask) / 2.0
-
-
-def _timeframe_to_seconds(tf_label):
+def _tf_label_to_oanda(tf_label: str) -> str:
     """
-    Convert your config labels to seconds:
+    Map your labels to OANDA granularity.
       '1m','3m','5m','15m','30m','1h','4h','1d'
     """
+    s = tf_label.strip().lower()
+    if s.endswith("m"):
+        return f"M{int(s[:-1])}"
+    if s.endswith("h"):
+        return f"H{int(s[:-1])}"
+    if s.endswith("d"):
+        return "D"
+    return "M1"
+
+
+def _tf_label_to_seconds(tf_label: str) -> int:
     s = tf_label.strip().lower()
     if s.endswith("m"):
         return int(s[:-1]) * 60
     if s.endswith("h"):
         return int(s[:-1]) * 3600
     if s.endswith("d"):
-        return int(s[:-1]) * 86400
-    # default to 60 seconds if unknown
+        return 86400
     return 60
 
 
+def _floor_to_period_utc(dt_utc, period_s):
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    seconds = int((dt_utc - epoch).total_seconds())
+    floored = seconds - (seconds % period_s)
+    return epoch + timedelta(seconds=floored)
+
+
 # =========================
-#   TICK STREAM
+#   TICK STREAM (unchanged)
 # =========================
 async def get_oanda_tick_stream(
-    instrument,          # OANDA instrument: "EUR_USD" (pass from main, override if needed)
-    display_symbol,      # Published as-is to NATS: e.g., "BTC/USDT" or "EUR/USD"
+    instrument,          # "EUR_USD"
+    display_symbol,      # Published as-is to NATS
     account_id,
     token,
     nc: NATS,
@@ -105,7 +110,7 @@ async def get_oanda_tick_stream(
     Connects to OANDA streaming pricing and emits ticks.
 
     - Publishes ticks with 'symbol' == display_symbol (unchanged from config)
-    - Optionally pushes simplified tick records onto tick_queue for candle builders
+    - Optionally pushes simplified tick records onto tick_queue (unused now)
     """
     base, quote = _display_split(display_symbol)
     print_symbol = (f"'{display_symbol}'" + "        ")[:11]
@@ -161,21 +166,20 @@ async def get_oanda_tick_stream(
                             continue
 
                         t = _parse_rfc3339(msg["time"])
-                        
                         last_mid = (bid + ask) / 2.0
 
                         tick_data = {
                             "exchange": "OANDA",
                             "tick_time": t,
-                            "symbol": display_symbol,          # <- keep your config symbol
+                            "symbol": display_symbol,
                             "base_currency": base,
                             "quote_currency": quote,
                             "bid": bid,
                             "ask": ask,
-                            "last_price": last_mid,   # FX has no "last trade" - use mid
-                            "high": last_mid,
+                            "last_price": last_mid,
+                            "high": last_mid,   # numeric to satisfy publish_tick
                             "low": last_mid,
-                            "volume": 0.0,                    # OANDA does not provide traded volume in ticks
+                            "volume": 0.0,      # OANDA ticks have no traded volume
                         }
 
                         logger.info(json.dumps({
@@ -188,13 +192,11 @@ async def get_oanda_tick_stream(
 
                         await publish_tick(nc, tick=tick_data)
 
-                        # also push to candle builders if requested
+                        # optional queue (not used now)
                         if tick_queue is not None:
                             try:
-                                tick_rec = {"t": t, "bid": bid, "ask": ask}
-                                tick_queue.put_nowait(tick_rec)
+                                tick_queue.put_nowait({"t": t, "bid": bid, "ask": ask})
                             except asyncio.QueueFull:
-                                # drop if overloaded; do not block the stream
                                 pass
 
                         await asyncio.sleep(0)
@@ -212,199 +214,121 @@ async def get_oanda_tick_stream(
 
 
 # =========================
-#   CANDLE BUILDER (from ticks)
+#   CANDLES VIA OANDA REST
 # =========================
-class _SimpleCandleState:
-    def __init__(self):
-        self.has_tick = False
-        self.open = 0.0
-        self.high = 0.0
-        self.low = 0.0
-        self.close = 0.0
-        self.volume = 0  # number of ticks
-
-
-async def get_oanda_candles_from_ticks(
-    display_symbol,       # Published as-is to NATS
-    timeframes,           # e.g., ["1m","3m","5m","1h","1d"]  (your config)
-    price_modes,          # e.g., ["M"] or ["M","B","A"]
-    nc: NATS = None,
-    tick_queue: asyncio.Queue = None,
-):
-    """
-    Builds closed candles from incoming ticks (produced by get_oanda_tick_stream).
-
-    - Consumes from tick_queue (non-blocking for the producer)
-    - For each timeframe label and price mode, maintains a single rolling candle
-    - On boundary switch, finalizes previous candle and publishes it
-    - Candle "volume" = number of ticks in that interval (OANDA semantics)
-    - Publishes with the *same timeframe labels* you configured (e.g., "1m")
-    """
-    if tick_queue is None:
-        raise ValueError("tick_queue is required")
-
-    # normalize labels and pre-compute periods
-    tf_labels = [str(t).strip() for t in timeframes]
-    tf_periods = {t: _timeframe_to_seconds(t) for t in tf_labels}
-    price_modes = [m.upper() for m in price_modes]
-
-    base, quote = _display_split(display_symbol)
-    print_symbol = (f"'{display_symbol}'" + "        ")[:11]
-
-    # one candle state per (timeframe_label, price_mode)
-    states = {}
-    starts = {}
-
-    for tf in tf_labels:
-        for m in price_modes:
-            key = (tf, m)
-            states[key] = _SimpleCandleState()
-            starts[key] = None  # open_time (UTC) for current rolling candle
-
-    while True:
-        try:
-            tick = await asyncio.wait_for(tick_queue.get(), timeout=5.0)
-        except asyncio.TimeoutError:
-            continue
-        except Exception as e:
-            notify_telegram("❌ DataCollectorApp-Candle (from ticks)\n" + str(e), ChatType.ALERT)
-            logger.exception(f"Error reading tick_queue: {e}")
-            continue
-
-        try:
-            t = tick["t"]          # datetime UTC
-            bid = float(tick["bid"])
-            ask = float(tick["ask"])
-        except Exception:
-            continue
-
-        for tf in tf_labels:
-            period_s = tf_periods[tf]
-            start = _floor_to_period_utc(t, period_s)
-
-            for m in price_modes:
-                key = (tf, m)
-                st = states[key]
-                cur_start = starts[key]
-
-                price = _pick_price(bid, ask, m)
-
-                # first tick for this candle
-                if cur_start is None:
-                    starts[key] = start
-                    st.has_tick = True
-                    st.open = price
-                    st.high = price
-                    st.low = price
-                    st.close = price
-                    st.volume = 1
-                    continue
-
-                # still inside same candle
-                if start == cur_start:
-                    if not st.has_tick:
-                        st.open = price
-                        st.high = price
-                        st.low = price
-                        st.close = price
-                        st.volume = 1
-                        st.has_tick = True
-                    else:
-                        if price > st.high:
-                            st.high = price
-                        if price < st.low:
-                            st.low = price
-                        st.close = price
-                        st.volume += 1
-                    continue
-
-                # boundary crossed -> finalize previous candle
-                if st.has_tick:
-                    close_time = cur_start + timedelta(seconds=period_s)
-                    candle_data = {
-                        "exchange": "OANDA",
-                        "symbol": display_symbol,      # <- keep your config symbol
-                        "base_currency": base,
-                        "quote_currency": quote,
-                        "timeframe": tf,               # <- keep your config timeframe label (e.g., "1m")
-                        "open_time": cur_start,        # UTC start of candle
-                        "open": float(st.open),
-                        "high": float(st.high),
-                        "low": float(st.low),
-                        "close": float(st.close),
-                        "volume": float(st.volume),    # number of ticks
-                        "close_time": close_time,
-                        "price_mode": m,               # "M"/"B"/"A" (optional field)
-                    }
-
-                    logger.info(json.dumps({
-                        "EventType": "Candle",
-                        "exchange": "OANDA",
-                        "symbol": print_symbol,
-                        "timeframe": tf,
-                        "close_time": close_time.isoformat(),
-                        "close": candle_data["close"]
-                    }))
-
-                    if nc is not None:
-                        await publish_candle(nc, candle=candle_data)
-
-                # start new candle with current tick
-                starts[key] = start
-                st.has_tick = True
-                st.open = price
-                st.high = price
-                st.low = price
-                st.close = price
-                st.volume = 1
-
-        await asyncio.sleep(0)
-
-
-# =========================
-#   CONVENIENCE
-# =========================
-def make_tick_queue(maxsize=5000):
-    return asyncio.Queue(maxsize=maxsize)
-
-
-async def run_oanda_ticks_and_candles(
-    display_symbol,       # e.g., "EUR/USD" or "BTC/USDT" (published as-is)
-    account_id,
-    token,
+async def get_oanda_candles_rest(
+    display_symbol: str,
+    instrument: str,            # "EUR_USD"
+    timeframes,                 # e.g., ["1m","3m","5m","1h","4h","1d"]
+    price_modes,                # ["M"] or ["M","B","A"]
+    token: str,
     nc: NATS,
     env=OandaEnv.LIVE,
-    instrument=None,      # if None, will be derived from display_symbol
-    timeframes=None,      # your config list
-    price_modes=None,     # e.g., ["M"] or ["M","B","A"]
+    poll_interval_sec: int = 2,
 ):
     """
-    Simple helper to start both tasks together.
+    Poll OANDA REST for CLOSED candles and publish them.
+    - Keeps your display_symbol and timeframe labels unchanged
+    - Publishes a candle only once per (timeframe, price_mode) open_time
     """
-    if timeframes is None:
-        timeframes = ["1m"]
-    if price_modes is None:
-        price_modes = ["M"]
-    if instrument is None:
-        instrument = _to_oanda_instrument(display_symbol)
+    base, quote = _display_split(display_symbol)
+    print_symbol = (f"'{display_symbol}'" + "        ")[:11]
+    host = _api_host(env)
 
-    q = make_tick_queue()
+    tf_labels = [str(t).lower() for t in timeframes]
+    price_modes = [m.upper() for m in price_modes]
 
-    producer = get_oanda_tick_stream(
-        instrument=instrument,
-        display_symbol=display_symbol,
-        account_id=account_id,
-        token=token,
-        nc=nc,
-        env=env,
-        tick_queue=q,
-    )
-    consumer = get_oanda_candles_from_ticks(
-        display_symbol=display_symbol,
-        timeframes=timeframes,
-        price_modes=price_modes,
-        nc=nc,
-        tick_queue=q,
-    )
+    # Track last published candle open_time per (tf_label, price_mode)
+    last_open_map = {}  # key: (tf_label, price_mode) -> datetime
 
-    await asyncio.gather(producer, consumer)
+    delay = 1.0
+    while True:
+        try:
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                for tf in tf_labels:
+                    og = _tf_label_to_oanda(tf)
+                    period_s = _tf_label_to_seconds(tf)
+
+                    for pm in price_modes:
+                        url = f"{host}/v3/instruments/{instrument}/candles"
+                        params = {
+                            "granularity": og,   # e.g., "M1","M5","H1","D"
+                            "price": pm,         # "M" | "B" | "A"
+                            "count": 2,          # get last 1-2 to be safe
+                        }
+                        headers = {"Authorization": f"Bearer {token}"}
+
+                        async with session.get(url, headers=headers, params=params) as resp:
+                            if resp.status != 200:
+                                text = await resp.text()
+                                raise RuntimeError(f"OANDA candles HTTP {resp.status}: {text}")
+
+                            data = await resp.json()
+                            candles = [c for c in data.get("candles", []) if c.get("complete")]
+                            if not candles:
+                                continue
+
+                            last = candles[-1]
+                            t_open = _parse_rfc3339(last["time"])
+                            key = (tf, pm)
+
+                            # Publish only once per open_time
+                            if last_open_map.get(key) == t_open:
+                                continue
+
+                            # choose OHLC set based on price mode
+                            price_key = {"M": "mid", "B": "bid", "A": "ask"}[pm]
+                            ohlc = last.get(price_key)
+                            if not ohlc:
+                                continue
+
+                            open_p = float(ohlc["o"])
+                            high_p = float(ohlc["h"])
+                            low_p  = float(ohlc["l"])
+                            close_p= float(ohlc["c"])
+                            vol    = float(last.get("volume", 0.0))
+                            close_time = t_open + timedelta(seconds=period_s)
+
+                            candle_data = {
+                                "exchange": "OANDA",
+                                "symbol": display_symbol,   # keep your label
+                                "base_currency": base,
+                                "quote_currency": quote,
+                                "timeframe": tf,            # keep your label, e.g., "1m"
+                                "open_time": t_open,
+                                "open": open_p,
+                                "high": high_p,
+                                "low": low_p,
+                                "close": close_p,
+                                "volume": vol,              # OANDA volume = number of price updates
+                                "close_time": close_time,
+                                "price_mode": pm,
+                            }
+
+                            logger.info(json.dumps({
+                                "EventType": "Candle",
+                                "exchange": "OANDA",
+                                "symbol": print_symbol,
+                                "timeframe": tf,
+                                "close_time": close_time.isoformat(),
+                                "close": candle_data["close"]
+                            }))
+
+                            await publish_candle(nc, candle=candle_data)
+                            last_open_map[key] = t_open
+
+                # small sleep between full cycles
+                await asyncio.sleep(poll_interval_sec)
+                delay = 1.0  # reset backoff on successful cycle
+
+        except (aiohttp.ClientConnectionError, aiohttp.ServerDisconnectedError, asyncio.TimeoutError, OSError) as e:
+            notify_telegram("❌ DataCollectorApp-Candle (OANDA REST)\n" + str(e), ChatType.ALERT)
+            logger.warning(f"OANDA REST candles error ({display_symbol}): {e}; retrying in ~{delay:.1f}s")
+            delay = await _reconnect_backoff(delay)
+            continue
+        except Exception as e:
+            notify_telegram("❌ DataCollectorApp-Candle (OANDA REST)\n" + str(e), ChatType.ALERT)
+            logger.exception(f"Unexpected OANDA REST candle error ({display_symbol}): {e}")
+            delay = await _reconnect_backoff(delay)
+            continue
