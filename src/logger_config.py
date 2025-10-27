@@ -18,7 +18,7 @@ def setup_logger():
     
 
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "quantflow_DataCollector.log"
+    log_file = log_dir / "quantflow_Oanda.log"
 
     file_handler = TimedRotatingFileHandler(
         str(log_file),
@@ -46,7 +46,7 @@ def setup_logger():
         handlers=handlers
     )
 
-    logger = logging.getLogger("quantflow_DataCollector")
+    logger = logging.getLogger("quantflow_Oanda")
     logger.info(
                 json.dumps({
                         "EventCode": 0,
