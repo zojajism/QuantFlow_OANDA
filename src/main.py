@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import random
 from pathlib import Path
 
 import yaml
@@ -16,10 +17,10 @@ from telegram_notifier import (
     ChatType,
 )
 
-# --- OANDA exchange adapter (ticks + candles via REST)
+# --- OANDA exchange adapter (ticks + candles via REST with runtime gap-fill)
 from exchange_oanda import (
     get_oanda_tick_stream,
-    get_oanda_candles_rest,  # <-- new: fetch closed candles from OANDA REST
+    get_oanda_candles_rest,
     OandaEnv,
 )
 
@@ -29,13 +30,24 @@ if not CONFIG_PATH.exists():
 
 
 def to_oanda_instrument(symbol_str: str) -> str:
-    """Convert 'EUR/USD' -> 'EUR_USD' (OANDA format)."""
+    # Convert "EUR/USD" -> "EUR_USD" (OANDA format)
     return symbol_str.strip().upper().replace("/", "_")
+
+
+# --- small wrappers to start tasks with a stagger delay
+async def _run_ticker_with_stagger(stagger_s: float, **kwargs):
+    # tiny offset so symbols don't all hit OANDA at once
+    await asyncio.sleep(stagger_s)
+    return await get_oanda_tick_stream(**kwargs)
+
+async def _run_candles_with_stagger(stagger_s: float, **kwargs):
+    await asyncio.sleep(stagger_s)
+    return await get_oanda_candles_rest(**kwargs)
 
 
 async def main():
     try:
-        # --- Load .env (Docker volume first, then local)
+        # Load .env (Docker volume first, then local)
         env_path = Path("/data/.env")
         if not env_path.exists():
             env_path = Path(__file__).resolve().parent / "data" / ".env"
@@ -46,7 +58,7 @@ async def main():
             json.dumps(
                 {
                     "EventCode": 0,
-                    "Message": "Starting QuantFlow_DataCollector (OANDA live)…",
+                    "Message": "Starting QuantFlow_DataCollector (OANDA)…",
                 }
             )
         )
@@ -54,19 +66,17 @@ async def main():
         await start_telegram_notifier()
         notify_telegram("❇️ Data Collector App started (OANDA)…", ChatType.ALERT)
 
-        # --- Load config
+        # Load config
         if not CONFIG_PATH.exists():
             raise FileNotFoundError(f"Config file not found: {CONFIG_PATH}")
 
         with CONFIG_PATH.open("r", encoding="utf-8") as f:
             config_data = yaml.safe_load(f) or {}
 
-        # Your same config structure
         symbols_cfg = [str(s) for s in config_data.get("symbols", [])]
-        timeframes = [str(t).lower() for t in config_data.get("timeframes", [])]  # e.g., ["1m","3m","1h","4h","1d"]
+        timeframes = [str(t).lower() for t in config_data.get("timeframes", [])]  # e.g., ["1m"]
 
-        # --- Env & credentials
-        # Set OANDA_ENV=live or practice in .env
+        # Env & credentials
         env_flag = (os.getenv("OANDA_ENV") or "live").strip().lower()
         oanda_env = OandaEnv.LIVE if env_flag == "live" else OandaEnv.PRACTICE
 
@@ -76,7 +86,7 @@ async def main():
         if not oanda_token or not oanda_account:
             raise RuntimeError("Missing OANDA_API_TOKEN or OANDA_ACCOUNT_ID in .env")
 
-        # --- NATS
+        # NATS
         nats_url = os.getenv("NATS_URL")
         nats_user = os.getenv("NATS_USER")
         nats_pass = os.getenv("NATS_PASS")
@@ -87,50 +97,56 @@ async def main():
         nc = NATS()
         await nc.connect(servers=[nats_url], user=nats_user, password=nats_pass)
 
-        # Ensure streams (same as your current flow)
+        # Ensure streams
         await ensure_streams_from_yaml(nc, "streams.yaml")
 
-        # --- Build tasks
+        # Build tasks
         ticker_tasks = []
         candle_tasks = []
 
-        # We’ll use mid-price candles by default; you can add ["B","A"] later if you want
+        # Use mid-price candles by default; you can add ["B","A"] later if needed
         price_modes = ["M"]
 
-        for symbol in symbols_cfg:
-            instrument = to_oanda_instrument(symbol)  # e.g., "EUR_USD"
+        for i, symbol in enumerate(symbols_cfg):
+            instrument = to_oanda_instrument(symbol)
 
-            # Ticker stream (producer) — optional but you already run it
+            # stagger per symbol: 0.10s .. 0.30s (with a tiny jitter so they’re not identical)
+            base_stagger = min(0.1 + 0.1 * i, 0.3)       # 0.1, 0.2, 0.3, 0.3, ...
+            jitter = random.uniform(0.0, 0.03)            # up to +30ms
+            stagger_s = base_stagger + jitter
+
+            # Ticker stream (optional; disable adding this task if you don't need ticks now)
             ticker_tasks.append(
-                get_oanda_tick_stream(
+                _run_ticker_with_stagger(
+                    stagger_s=stagger_s,
                     instrument=instrument,
                     display_symbol=symbol,
                     account_id=oanda_account,
                     token=oanda_token,
                     nc=nc,
                     env=oanda_env,
-                    tick_queue=None,  # no need to feed candle builders now
+                    tick_queue=None,
                 )
             )
 
-            # Candle fetcher from OANDA REST for ALL requested timeframes of this symbol
+            # Candle fetcher with runtime no-data handling per symbol
             if timeframes:
                 candle_tasks.append(
-                    get_oanda_candles_rest(
+                    _run_candles_with_stagger(
+                        stagger_s=stagger_s,
                         display_symbol=symbol,
                         instrument=instrument,
-                        timeframes=timeframes,   # e.g., ["1m","3m","5m","1h","4h","1d"]
-                        price_modes=price_modes, # ["M"] now; can become ["M","B","A"]
+                        timeframes=timeframes,    # e.g., ["1m"]
+                        price_modes=price_modes,  # ["M"] now
                         token=oanda_token,
                         nc=nc,
                         env=oanda_env,
-                        poll_interval_sec=2,     # small polling loop; adjust if needed
+                        poll_interval_sec=2,      # small polling loop
                     )
                 )
 
-        # --- Run
+        # Run (each item is a coroutine; gather will schedule them concurrently)
         await asyncio.gather(*candle_tasks, *ticker_tasks)
-        
 
     finally:
         notify_telegram("⛔️ Data Collector App stopped.", ChatType.ALERT)
