@@ -2,9 +2,9 @@ import asyncio
 import json
 import logging
 import random
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time
 from typing import Dict, Tuple, Optional
-
+import datetime as dt
 import aiohttp
 from nats.aio.client import Client as NATS
 from quantflow_publisher import publish_tick, publish_candle
@@ -110,21 +110,19 @@ def _floor_to_period_utc(dt_utc, period_s):
 # =========================
 #   LIGHTWEIGHT FX CALENDAR
 # =========================
-def _is_fx_open(now_utc: datetime) -> bool:
-    """Spot FX open: Sun 17:00 NY through Fri 17:00 NY."""
+def _is_fx_open(now_utc: dt.datetime) -> bool:
     if now_utc.tzinfo is None:
-        now_utc = now_utc.replace(tzinfo=timezone.utc)
+        now_utc = now_utc.replace(tzinfo=dt.timezone.utc)
     now_ny = now_utc.astimezone(NY)
-    wd = now_ny.weekday()  # Mon=0 ... Sun=6
+    wd = now_ny.weekday()
     t = now_ny.time()
     if wd == 6:  # Sunday
-        return t >= datetime.time(17, 0)
+        return t >= dt.time(17, 0)
     if wd in (0, 1, 2, 3):  # Mon-Thu
         return True
     if wd == 4:  # Friday
-        return t < datetime.time(17, 0)
+        return t < dt.time(17, 0)
     return False  # Saturday
-
 
 # =========================
 #   TICK STREAM (unchanged)
