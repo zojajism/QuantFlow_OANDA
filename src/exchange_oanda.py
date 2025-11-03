@@ -9,6 +9,8 @@ import aiohttp
 from nats.aio.client import Client as NATS
 from quantflow_publisher import publish_tick, publish_candle
 from telegram_notifier import notify_telegram, ChatType
+from dxy_builder import on_source_candle as on_dxy_source_candle
+
 
 # --- lightweight market calendar (New York time for FX session)
 try:
@@ -292,6 +294,23 @@ async def get_oanda_candles_rest(
                                 "close_time": real_last_open + timedelta(seconds=period_s),
                                 "price_mode": pm,
                             })
+                            
+                            # ----------------- DXY Builder ----------------------
+                            candle={
+                                "exchange": "OANDA",
+                                "symbol": display_symbol,
+                                "base_currency": base,
+                                "quote_currency": quote,
+                                "timeframe": tf,
+                                "open_time": real_last_open,
+                                "open": o, "high": h, "low": l, "close": c,
+                                "volume": real_last_vol,
+                                "close_time": real_last_open + timedelta(seconds=period_s),
+                                "price_mode": pm,
+                            }
+                            await on_dxy_source_candle(nc, candle)
+                            # ----------------- DXY Builder ----------------------
+
                             last_open_map[key] = real_last_open
                             last_close_px_map[key] = c
                             continue
@@ -316,6 +335,23 @@ async def get_oanda_candles_rest(
                                     "close_time": open_time + timedelta(seconds=period_s),
                                     "price_mode": pm,
                                 })
+
+                                # ----------------- DXY Builder ----------------------
+                                candle={
+                                    "exchange": "OANDA",
+                                    "symbol": display_symbol,
+                                    "base_currency": base,
+                                    "quote_currency": quote,
+                                    "timeframe": tf,
+                                    "open_time": open_time,
+                                    "open": px, "high": px, "low": px, "close": px,
+                                    "volume": 0.0,
+                                    "close_time": open_time + timedelta(seconds=period_s),
+                                    "price_mode": pm,
+                                }
+                                await on_dxy_source_candle(nc, candle)
+                                # ----------------- DXY Builder ----------------------
+
                                 last_open_map[key] = open_time
                                 last_close_px_map[key] = px
                                 expected += timedelta(seconds=period_s)
@@ -334,6 +370,23 @@ async def get_oanda_candles_rest(
                                 "close_time": real_last_open + timedelta(seconds=period_s),
                                 "price_mode": pm,
                             })
+
+                            # ----------------- DXY Builder ----------------------
+                            candle={
+                                "exchange": "OANDA",
+                                "symbol": display_symbol,
+                                "base_currency": base,
+                                "quote_currency": quote,
+                                "timeframe": tf,
+                                "open_time": real_last_open,
+                                "open": o, "high": h, "low": l, "close": c,
+                                "volume": real_last_vol,
+                                "close_time": real_last_open + timedelta(seconds=period_s),
+                                "price_mode": pm,
+                            }
+                            await on_dxy_source_candle(nc, candle)
+                            # ----------------- DXY Builder ----------------------
+
                             last_open_map[key] = real_last_open
                             last_close_px_map[key] = c
                             continue
@@ -365,6 +418,23 @@ async def get_oanda_candles_rest(
                                             "close_time": fill_ptr + timedelta(seconds=period_s),
                                             "price_mode": pm,
                                         })
+
+                                        # ----------------- DXY Builder ----------------------
+                                        candle={
+                                            "exchange": "OANDA",
+                                            "symbol": display_symbol,
+                                            "base_currency": base,
+                                            "quote_currency": quote,
+                                            "timeframe": tf,
+                                            "open_time": fill_ptr,
+                                            "open": px, "high": px, "low": px, "close": px,
+                                            "volume": 0.0,
+                                            "close_time": fill_ptr + timedelta(seconds=period_s),
+                                            "price_mode": pm,
+                                        }
+                                        await on_dxy_source_candle(nc, candle)
+                                        # ----------------- DXY Builder ----------------------
+
                                         last_open_map[key] = fill_ptr
                                         last_close_px_map[key] = px
                                         fill_ptr += timedelta(seconds=period_s)
@@ -383,6 +453,23 @@ async def get_oanda_candles_rest(
                                         "close_time": conf_open + timedelta(seconds=period_s),
                                         "price_mode": pm,
                                     })
+
+                                    # ----------------- DXY Builder ----------------------
+                                    candle={
+                                        "exchange": "OANDA",
+                                        "symbol": display_symbol,
+                                        "base_currency": base,
+                                        "quote_currency": quote,
+                                        "timeframe": tf,
+                                        "open_time": conf_open,
+                                        "open": o, "high": h, "low": l, "close": c,
+                                        "volume": conf_vol,
+                                        "close_time": conf_open + timedelta(seconds=period_s),
+                                        "price_mode": pm,
+                                    }
+                                    await on_dxy_source_candle(nc, candle)
+                                    # ----------------- DXY Builder ----------------------
+
                                     last_open_map[key] = conf_open
                                     last_close_px_map[key] = c
                                     expected = conf_open + timedelta(seconds=period_s)
@@ -402,6 +489,23 @@ async def get_oanda_candles_rest(
                                 "close_time": expected + timedelta(seconds=period_s),
                                 "price_mode": pm,
                             })
+
+                            # ----------------- DXY Builder ----------------------
+                            candle={
+                                "exchange": "OANDA",
+                                "symbol": display_symbol,
+                                "base_currency": base,
+                                "quote_currency": quote,
+                                "timeframe": tf,
+                                "open_time": expected,
+                                "open": px, "high": px, "low": px, "close": px,
+                                "volume": 0.0,
+                                "close_time": expected + timedelta(seconds=period_s),
+                                "price_mode": pm,
+                            }
+                            await on_dxy_source_candle(nc, candle)
+                            # ----------------- DXY Builder ----------------------
+
                             last_open_map[key] = expected
                             last_close_px_map[key] = px
                             expected += timedelta(seconds=period_s)
