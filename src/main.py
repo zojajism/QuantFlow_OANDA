@@ -146,8 +146,12 @@ async def main():
                 )
 
         # Run (each item is a coroutine; gather will schedule them concurrently)
-        #await asyncio.gather(*candle_tasks, *ticker_tasks)
-        await asyncio.gather(*candle_tasks)
+        GET_TICK = os.getenv("GET_TICK")
+
+        if (GET_TICK):
+            await asyncio.gather(*candle_tasks, *ticker_tasks)
+        else:
+            await asyncio.gather(*candle_tasks)
 
     finally:
         notify_telegram("⛔️ Data Collector App stopped.", ChatType.ALERT)
